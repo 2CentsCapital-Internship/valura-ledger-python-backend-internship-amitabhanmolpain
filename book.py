@@ -68,6 +68,9 @@ class Book:
         # Customer positions
         self.positions = defaultdict(lambda: defaultdict(Decimal))
 
+        # Posted legs, keyed by event_id, for reversal lookup
+        self.posted_legs = {}
+
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
         """Post one event and return its legs.
@@ -101,6 +104,7 @@ class Book:
             return []
         self._post(legs)
         # Store the posted legs so reversals can invert them later
+        self.posted_legs[eid] = legs
         self.events[eid]["_posted_legs"] = legs
         return legs
 
@@ -380,83 +384,92 @@ class Book:
         return self.on_order_cancelled(p, ev)
 
     def on_dividend_cash(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1100 net / Cr 2010 net. Tax is withheld at source, so raise no "
-            "payable")
+        try:
+            net = money(D(str(p["net_amount"])))
+            cid = p["customer_id"]
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            raise Rejected("Invalid dividend_cash payload")
+
+        return [
+            leg("1100", cid, debit=net),
+            leg("2010", cid, credit=net)
+        ]
 
     def on_dividend_reinvested(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1200 net / Cr 2100 net, and add a lot. Cash is not involved")
+        try:
+            net = money(D(str(p["net_amount"])))
+            cid = p["customer_id"]
+            symbol = p["symbol"]
+            qty = Decimal(str(p["reinvest_quantity"]))
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            raise Rejected("Invalid dividend_reinvested payload")
+
+        # Add a FIFO lot at cost = net
+        self.lots[cid][symbol].append({"quantity": qty, "cost": net})
+        self.positions[cid][symbol] += qty
+
+        return [
+            leg("1200", cid, debit=net),
+            leg("2100", cid, credit=net)
+        ]
 
     def on_stock_split(self, p, ev):
-        raise NotImplementedError(
-            "No legs. Quantity scales; total cost does not change")
+        try:
+            cid = p["customer_id"]
+            symbol = p["symbol"]
+            ratio_from = Decimal(str(p["ratio_from"]))
+            ratio_to = Decimal(str(p["ratio_to"]))
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            raise Rejected("Invalid stock_split payload")
+
+        ratio = ratio_to / ratio_from
+
+        # Scale quantity of each lot; total cost stays the same
+        for lot in self.lots[cid][symbol]:
+            lot["quantity"] = (lot["quantity"] * ratio).normalize()
+
+        # Update tracked position
+        if symbol in self.positions[cid]:
+            self.positions[cid][symbol] = (self.positions[cid][symbol] * ratio).normalize()
+
+        return []  # No legs
 
     def on_symbol_change(self, p, ev):
-        raise NotImplementedError("No legs. Re-key the holding")
+        try:
+            cid = p["customer_id"]
+            old_sym = p["old_symbol"]
+            new_sym = p["new_symbol"]
+        except KeyError:
+            raise Rejected("Invalid symbol_change payload")
+
+        # Re-key lots
+        if old_sym in self.lots[cid]:
+            self.lots[cid][new_sym] = self.lots[cid].pop(old_sym)
+
+        # Re-key positions
+        if old_sym in self.positions[cid]:
+            self.positions[cid][new_sym] = self.positions[cid].pop(old_sym)
+
+        return []  # No legs
 
     def on_reversal(self, p, ev):
         try:
-            original_id = p["reverses_event_id"]
+            original_event = p["reverses_event_id"]
+            original_legs = self.posted_legs[original_event]
         except KeyError:
-            raise Rejected("Invalid reversal payload: missing reverses_event_id")
+            raise Rejected("Original event not found")
 
-        # Look up the original event
-        original = self.events.get(original_id)
-        if original is None:
-            raise Rejected("Reversal of unknown event")
+        reversed_legs = []
 
-        # Look up the legs we posted for the original event
-        original_legs = self.events.get(original_id, {}).get("_posted_legs")
-        if original_legs is None:
-            # Re-derive legs by replaying the original event's handler
-            # but we don't have them stored — use balances approach:
-            # We need to have stored the original posted legs. For now, use
-            # the event payload to determine what to undo.
-            raise Rejected("Original event legs not stored, cannot reverse")
-
-        # Build reversed legs: swap debit and credit on every leg
-        reversed_legs = [
-            leg(l["account"], l["customer_id"],
-                debit=D(l["credit"]), credit=D(l["debit"]))
-            for l in original_legs
-        ]
-
-        # Undo lot book changes for order_filled events
-        orig_type = original.get("type")
-        orig_payload = original.get("payload", {})
-
-        if orig_type in ("order_filled", "order_partially_filled"):
-            side = orig_payload.get("side")
-            cid = orig_payload.get("customer_id")
-            symbol = orig_payload.get("symbol")
-            try:
-                quantity = Decimal(str(orig_payload.get("quantity", "0")))
-                principal = money(Decimal(str(orig_payload.get("principal", "0"))))
-            except (InvalidOperation, TypeError, ValueError):
-                raise Rejected("Cannot parse original order_filled payload for reversal")
-
-            if side == "buy":
-                # Undo the buy: remove the lot we added (pop last added)
-                lots = self.lots[cid][symbol]
-                if lots:
-                    lots.pop()  # remove the lot added by this buy
-                self.positions[cid][symbol] -= quantity
-                if self.positions[cid][symbol] <= 0:
-                    del self.positions[cid][symbol]
-
-            elif side == "sell":
-                # Undo the sell: add back the lot we consumed
-                # We stored the cost in self.trades
-                trade_id = orig_payload.get("trade_id")
-                trade = self.trades.get(trade_id, {})
-                cost = trade.get("cost", principal)
-                # Re-insert the lot at the front (LIFO for reversal)
-                self.lots[cid][symbol].insert(0, {
-                    "quantity": quantity,
-                    "cost": cost
-                })
-                self.positions[cid][symbol] += quantity
+        for l in original_legs:
+            reversed_legs.append(
+                leg(
+                    l["account"],
+                    l["customer_id"],
+                    debit=l["credit"],
+                    credit=l["debit"]
+                )
+            )
 
         return reversed_legs
 
