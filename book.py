@@ -270,8 +270,30 @@ class Book:
             "Cr 2400 reg. Cash does NOT move on the trade date")
 
     def on_trade_settled(self, p, ev):
-        raise NotImplementedError(
-            "buy: Dr 2350 / Cr 1100.  sell: Dr 1100 / Cr 1150")
+        try:
+            trade_id = p["trade_id"]
+            trade = self.trades[trade_id]
+
+            amount = trade["principal"]
+            cid = trade["customer_id"]
+            side = trade["side"]
+
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            raise Rejected("Invalid trade_settled payload")
+
+        if side == "buy":
+            return [
+                leg("2350", cid, debit=amount),
+                leg("1100", cid, credit=amount)
+            ]
+
+        elif side == "sell":
+            return [
+                leg("1100", cid, debit=amount),
+                leg("1150", cid, credit=amount)
+            ]
+
+        raise Rejected("Unknown trade side")
 
     def on_order_cancelled(self, p, ev):
         try:
