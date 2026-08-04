@@ -128,9 +128,24 @@ class Book:
         ]
 
     def on_fee_refund(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1100 / Cr 2010. The amount is NOT in this payload: look it up "
-            "from the fee_charged event named by refunds_source_id")
+        try:
+            refund_id = p["refunds_source_id"]
+
+            if refund_id not in self.fees:
+                raise Rejected("Original fee not found")
+
+            amount = self.fees[refund_id]
+
+            original = self.events[refund_id]
+            cid = original["payload"]["customer_id"]
+
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            raise Rejected("Invalid fee_refund payload")
+
+        return [
+            leg("1100", cid, debit=amount),
+            leg("2010", cid, credit=amount)
+        ]
 
     def on_interest_credited(self, p, ev):
         raise NotImplementedError(
