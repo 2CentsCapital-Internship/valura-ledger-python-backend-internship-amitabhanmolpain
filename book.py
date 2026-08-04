@@ -71,6 +71,9 @@ class Book:
         # Posted legs, keyed by event_id, for reversal lookup
         self.posted_legs = {}
 
+        # Reversed events set for double-reversal protection
+        self.reversed_events = set()
+
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
         """Post one event and return its legs.
@@ -383,6 +386,22 @@ class Book:
     def on_order_rejected(self, p, ev):
         return self.on_order_cancelled(p, ev)
 
+    def on_broker_fees_settled(self, p, ev):
+        print("BROKER FEES SETTLED:", p)
+        raise NotImplementedError()
+
+    def on_custodian_fees_settled(self, p, ev):
+        print("CUSTODIAN FEES:", p)
+        raise NotImplementedError()
+
+    def on_partner_payout(self, p, ev):
+        print("PARTNER PAYOUT:", p)
+        raise NotImplementedError()
+
+    def on_reg_fees_remitted(self, p, ev):
+        print("REG FEES:", p)
+        raise NotImplementedError()
+
     def on_dividend_cash(self, p, ev):
         try:
             net = money(D(str(p["net_amount"])))
@@ -459,6 +478,11 @@ class Book:
         except KeyError:
             raise Rejected("Original event not found")
 
+        if original_event in self.reversed_events:
+            raise Rejected("Already reversed")
+
+        self.reversed_events.add(original_event)
+
         reversed_legs = []
 
         for l in original_legs:
@@ -532,7 +556,7 @@ class Book:
                 total_cost = sum(lot["cost"] for lot in lots)
                 if total_qty > ZERO:
                     c["positions"][symbol] = {
-                        "quantity": str(total_qty.normalize()),
+                        "quantity": f"{total_qty:f}",
                         "cost_basis": str(money(total_cost))
                     }
 
