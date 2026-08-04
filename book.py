@@ -100,6 +100,8 @@ class Book:
             # must leave your book exactly as it was.
             return []
         self._post(legs)
+        # Store the posted legs so reversals can invert them later
+        self.events[eid]["_posted_legs"] = legs
         return legs
 
     def _post(self, legs: list[dict]) -> None:
@@ -305,8 +307,40 @@ class Book:
                 leg("4000", cid, credit=commission)
             ]
 
-        # Sell not implemented yet
-        raise NotImplementedError("Sell orders not implemented yet")
+        if side == "sell":
+            # FIFO cost of shares sold
+            cost = self.consume_fifo(cid, symbol, quantity)
+
+            # Regulatory fee: principal x 0.0008, rounded to cent
+            reg = money(principal * Decimal("0.0008"))
+
+            # Store trade for later settlement
+            self.trades[trade_id] = {
+                "customer_id": cid,
+                "principal": principal,
+                "commission": commission,
+                "cost": cost,
+                "side": side
+            }
+
+            # Update customer position
+            self.positions[cid][symbol] -= quantity
+
+            # Remove position if fully sold out
+            if self.positions[cid][symbol] <= 0:
+                del self.positions[cid][symbol]
+
+            return [
+                leg("1150", cid, debit=principal),
+                leg("2100", cid, debit=cost),
+
+                leg("2010", cid, credit=principal - commission - reg),
+                leg("1200", cid, credit=cost),
+                leg("4000", cid, credit=commission),
+                leg("2400", cid, credit=reg)
+            ]
+
+        raise Rejected(f"Unknown order side: {side}")
 
     def on_trade_settled(self, p, ev):
         try:
@@ -362,10 +396,100 @@ class Book:
         raise NotImplementedError("No legs. Re-key the holding")
 
     def on_reversal(self, p, ev):
-        raise NotImplementedError(
-            "Post the exact inverse of the original's legs, and undo its effect "
-            "on your LOT BOOK too. A reversed buy whose lot you leave behind "
-            "balances perfectly and corrupts every later cost basis")
+        try:
+            original_id = p["reverses_event_id"]
+        except KeyError:
+            raise Rejected("Invalid reversal payload: missing reverses_event_id")
+
+        # Look up the original event
+        original = self.events.get(original_id)
+        if original is None:
+            raise Rejected("Reversal of unknown event")
+
+        # Look up the legs we posted for the original event
+        original_legs = self.events.get(original_id, {}).get("_posted_legs")
+        if original_legs is None:
+            # Re-derive legs by replaying the original event's handler
+            # but we don't have them stored — use balances approach:
+            # We need to have stored the original posted legs. For now, use
+            # the event payload to determine what to undo.
+            raise Rejected("Original event legs not stored, cannot reverse")
+
+        # Build reversed legs: swap debit and credit on every leg
+        reversed_legs = [
+            leg(l["account"], l["customer_id"],
+                debit=D(l["credit"]), credit=D(l["debit"]))
+            for l in original_legs
+        ]
+
+        # Undo lot book changes for order_filled events
+        orig_type = original.get("type")
+        orig_payload = original.get("payload", {})
+
+        if orig_type in ("order_filled", "order_partially_filled"):
+            side = orig_payload.get("side")
+            cid = orig_payload.get("customer_id")
+            symbol = orig_payload.get("symbol")
+            try:
+                quantity = Decimal(str(orig_payload.get("quantity", "0")))
+                principal = money(Decimal(str(orig_payload.get("principal", "0"))))
+            except (InvalidOperation, TypeError, ValueError):
+                raise Rejected("Cannot parse original order_filled payload for reversal")
+
+            if side == "buy":
+                # Undo the buy: remove the lot we added (pop last added)
+                lots = self.lots[cid][symbol]
+                if lots:
+                    lots.pop()  # remove the lot added by this buy
+                self.positions[cid][symbol] -= quantity
+                if self.positions[cid][symbol] <= 0:
+                    del self.positions[cid][symbol]
+
+            elif side == "sell":
+                # Undo the sell: add back the lot we consumed
+                # We stored the cost in self.trades
+                trade_id = orig_payload.get("trade_id")
+                trade = self.trades.get(trade_id, {})
+                cost = trade.get("cost", principal)
+                # Re-insert the lot at the front (LIFO for reversal)
+                self.lots[cid][symbol].insert(0, {
+                    "quantity": quantity,
+                    "cost": cost
+                })
+                self.positions[cid][symbol] += quantity
+
+        return reversed_legs
+
+    # -- helpers -------------------------------------------------------------
+    def consume_fifo(self, customer_id: str, symbol: str, quantity: Decimal) -> Decimal:
+        """Remove FIFO lots for a sell. Returns the total cost basis consumed."""
+        lots = self.lots[customer_id][symbol]
+
+        remaining = quantity
+        total_cost = ZERO
+
+        while remaining > 0:
+            if not lots:
+                raise Rejected("Oversell")
+
+            lot = lots[0]
+
+            if lot["quantity"] <= remaining:
+                total_cost += lot["cost"]
+                remaining -= lot["quantity"]
+                lots.pop(0)
+            else:
+                ratio = remaining / lot["quantity"]
+                cost_used = money(lot["cost"] * ratio)
+
+                total_cost += cost_used
+
+                lot["cost"] -= cost_used
+                lot["quantity"] -= remaining
+
+                remaining = Decimal("0")
+
+        return money(total_cost)
 
     # -- reporting ----------------------------------------------------------
     def snapshot(self) -> dict:
