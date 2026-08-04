@@ -167,6 +167,7 @@ class Book:
         ]
 
     def on_transfer_between_customers(self, p, ev):
+        print("transfer_between_customers called", p)
         try:
             amount = money(D(str(p["amount"])))
             from_customer = p["from_customer_id"]
@@ -198,14 +199,49 @@ class Book:
         ]
 
     def on_withdrawal_requested(self, p, ev):
-        raise NotImplementedError("Dr 2010 amount / Cr 2300 amount")
+        try:
+            amount = money(D(str(p["amount"])))
+            cid = p["customer_id"]
+            wid = p.get("withdrawal_id", ev["event_id"])
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            raise Rejected("Invalid withdrawal_requested payload")
+
+        req = {"amount": amount, "customer_id": cid}
+        self.withdrawals[wid] = req
+        self.withdrawals[ev["event_id"]] = req
+
+        return [
+            leg("2010", cid, debit=amount),
+            leg("2300", cid, credit=amount)
+        ]
 
     def on_withdrawal_settled(self, p, ev):
-        raise NotImplementedError(
-            "Dr 2300 / Cr 1100. Look up the amount from the request")
+        try:
+            wid = p["withdrawal_id"]
+            req = self.withdrawals[wid]
+            amount = req["amount"]
+            cid = req["customer_id"]
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            raise Rejected("Invalid withdrawal_settled payload or request not found")
+
+        return [
+            leg("2300", cid, debit=amount),
+            leg("1100", cid, credit=amount)
+        ]
 
     def on_withdrawal_rejected(self, p, ev):
-        raise NotImplementedError("Dr 2300 / Cr 2010")
+        try:
+            wid = p["withdrawal_id"]
+            req = self.withdrawals[wid]
+            amount = req["amount"]
+            cid = req["customer_id"]
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            raise Rejected("Invalid withdrawal_rejected payload or request not found")
+
+        return [
+            leg("2300", cid, debit=amount),
+            leg("2010", cid, credit=amount)
+        ]
 
     def on_order_placed(self, p, ev):
         raise NotImplementedError(
