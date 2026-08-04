@@ -148,8 +148,21 @@ class Book:
         ]
 
     def on_interest_credited(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1100 gross / Cr 2010 customer_share / Cr 4200 the remainder")
+        try:
+            gross = money(D(str(p["gross_amount"])))
+            customer_share = money(D(str(p["customer_share"])))
+            cid = p["customer_id"]
+
+            company_share = money(gross - customer_share)
+
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            raise Rejected("Invalid interest_credited payload")
+
+        return [
+            leg("1100", cid, debit=gross),
+            leg("2010", cid, credit=customer_share),
+            leg("4200", cid, credit=company_share)
+        ]
 
     def on_transfer_between_customers(self, p, ev):
         raise NotImplementedError(
