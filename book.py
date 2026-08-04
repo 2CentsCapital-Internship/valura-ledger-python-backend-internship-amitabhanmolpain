@@ -181,9 +181,21 @@ class Book:
         ]
 
     def on_fx_deposit(self, p, ev):
-        raise NotImplementedError(
-            "Dr 1100 usd_at_market_rate / Cr 2010 usd_at_customer_rate / "
-            "Cr 4100 the difference")
+        try:
+            market = money(D(str(p["usd_at_market_rate"])))
+            customer = money(D(str(p["usd_at_customer_rate"])))
+            cid = p["customer_id"]
+
+            spread = money(market - customer)
+
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            raise Rejected("Invalid fx_deposit payload")
+
+        return [
+            leg("1100", cid, debit=market),
+            leg("2010", cid, credit=customer),
+            leg("4100", cid, credit=spread)
+        ]
 
     def on_withdrawal_requested(self, p, ev):
         raise NotImplementedError("Dr 2010 amount / Cr 2300 amount")
