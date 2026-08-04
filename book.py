@@ -244,9 +244,15 @@ class Book:
         ]
 
     def on_order_placed(self, p, ev):
-        raise NotImplementedError(
-            "No legs. A placement moves no money: it creates a hold, which is "
-            "reported at checkpoints and never posted")
+        try:
+            order_id = p["order_id"]
+
+        except KeyError:
+            raise Rejected("Invalid order_placed payload")
+
+        self.orders[order_id] = p
+
+        return []
 
     def on_order_partially_filled(self, p, ev):
         return self.on_order_filled(p, ev)
@@ -264,7 +270,14 @@ class Book:
             "buy: Dr 2350 / Cr 1100.  sell: Dr 1100 / Cr 1150")
 
     def on_order_cancelled(self, p, ev):
-        raise NotImplementedError("No legs. Release the remaining hold")
+        try:
+            order_id = p["order_id"]
+        except KeyError:
+            raise Rejected("Invalid order_cancelled payload")
+
+        self.orders.pop(order_id, None)
+
+        return []
 
     def on_order_rejected(self, p, ev):
         return self.on_order_cancelled(p, ev)
