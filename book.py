@@ -20,7 +20,7 @@ Two things to get right before anything else:
 from __future__ import annotations
 
 from collections import defaultdict
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 
 D = Decimal
 ZERO = D("0.00")
@@ -45,6 +45,21 @@ class Book:
         # the run: the client keeps consuming and tells you the list at the end.
         self.todo: dict[str, int] = defaultdict(int)
 
+        # Store previous events
+        self.events = {}
+
+        # Store withdrawal requests
+        self.withdrawals = {}
+
+        # Store fee events
+        self.fees = {}
+
+        # Store orders
+        self.orders = {}
+
+        # Store trades
+        self.trades = {}
+
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
         """Post one event and return its legs.
@@ -54,6 +69,7 @@ class Book:
         Posting twice is the single most expensive mistake available here.
         """
         eid = ev["event_id"]
+        self.events[eid] = ev
         if eid in self.seen:
             return []                      # already posted; nothing new happens
         self.seen.add(eid)
@@ -98,7 +114,18 @@ class Book:
 
     # -- yours --------------------------------------------------------------
     def on_fee_charged(self, p, ev):
-        raise NotImplementedError("Dr 2010 amount / Cr 1100 amount")
+        try:
+            amount = money(D(str(p["amount"])))
+            cid = p["customer_id"]
+        except (InvalidOperation, TypeError, ValueError, KeyError) as e:
+            raise Rejected(f"Invalid fee_charged payload: {p}") from e
+
+        self.fees[ev["event_id"]] = amount
+
+        return [
+            leg("2010", cid, debit=amount),
+            leg("1100", cid, credit=amount)
+        ]
 
     def on_fee_refund(self, p, ev):
         raise NotImplementedError(
