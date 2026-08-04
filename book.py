@@ -62,7 +62,11 @@ class Book:
         # Store trades
         self.trades = {}
 
+        # FIFO lots
         self.lots = defaultdict(lambda: defaultdict(list))
+
+        # Customer positions
+        self.positions = defaultdict(lambda: defaultdict(Decimal))
 
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
@@ -249,12 +253,9 @@ class Book:
 
     def on_order_placed(self, p, ev):
         try:
-            order_id = p["order_id"]
-
+            self.orders[p["order_id"]] = p
         except KeyError:
-            raise Rejected("Invalid order_placed payload")
-
-        self.orders[order_id] = p
+            raise Rejected("Invalid order")
 
         return []
 
@@ -262,12 +263,50 @@ class Book:
         return self.on_order_filled(p, ev)
 
     def on_order_filled(self, p, ev):
-        raise NotImplementedError(
-            "buy:  Dr 2010 principal+commission, Dr 1200 principal / "
-            "Cr 2350 principal, Cr 2100 principal, Cr 4000 commission. "
-            "sell: Dr 1150 principal, Dr 2100 FIFO cost / Cr 2010 "
-            "principal-commission-reg, Cr 1200 cost, Cr 4000 commission, "
-            "Cr 2400 reg. Cash does NOT move on the trade date")
+        try:
+            cid = p["customer_id"]
+            side = p["side"]
+            symbol = p["symbol"]
+
+            quantity = Decimal(str(p["quantity"]))
+            principal = money(Decimal(str(p["principal"])))
+
+            commission = money(Decimal(str(p.get("commission", "0.00"))))
+
+            trade_id = p["trade_id"]
+
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            raise Rejected("Invalid order_filled payload")
+
+        if side == "buy":
+            # Store trade for later settlement
+            self.trades[trade_id] = {
+                "customer_id": cid,
+                "principal": principal,
+                "commission": commission,
+                "side": side
+            }
+
+            # Add FIFO lot
+            self.lots[cid][symbol].append({
+                "quantity": quantity,
+                "cost": principal
+            })
+
+            # Update customer position
+            self.positions[cid][symbol] += quantity
+
+            return [
+                leg("2010", cid, debit=principal + commission),
+                leg("1200", cid, debit=principal),
+
+                leg("2350", cid, credit=principal),
+                leg("2100", cid, credit=principal),
+                leg("4000", cid, credit=commission)
+            ]
+
+        # Sell not implemented yet
+        raise NotImplementedError("Sell orders not implemented yet")
 
     def on_trade_settled(self, p, ev):
         try:
@@ -297,11 +336,9 @@ class Book:
 
     def on_order_cancelled(self, p, ev):
         try:
-            order_id = p["order_id"]
+            self.orders.pop(p["order_id"], None)
         except KeyError:
             raise Rejected("Invalid order_cancelled payload")
-
-        self.orders.pop(order_id, None)
 
         return []
 
@@ -348,6 +385,37 @@ class Book:
                                            "cash_hold": ZERO, "positions": {}})
             if acct == "2010":
                 c["wallet_cash"] += -bal          # a liability, so credit-positive
+
+        # Build positions from FIFO lots
+        for cid, symbols in self.lots.items():
+            c = customers.setdefault(cid, {"wallet_cash": ZERO,
+                                           "cash_hold": ZERO, "positions": {}})
+            for symbol, lots in symbols.items():
+                total_qty = sum(lot["quantity"] for lot in lots)
+                total_cost = sum(lot["cost"] for lot in lots)
+                if total_qty > ZERO:
+                    c["positions"][symbol] = {
+                        "quantity": str(total_qty.normalize()),
+                        "cost_basis": str(money(total_cost))
+                    }
+
+        # Build cash hold from open buy orders
+        for order_id, order in self.orders.items():
+            cid = order.get("customer_id")
+            if not cid:
+                continue
+            c = customers.setdefault(cid, {"wallet_cash": ZERO,
+                                           "cash_hold": ZERO, "positions": {}})
+            side = order.get("side")
+            if side == "buy":
+                try:
+                    qty = Decimal(str(order.get("quantity", "0")))
+                    limit_price = Decimal(str(order.get("limit_price", "0")))
+                    est_commission = Decimal(str(order.get("est_commission", "0")))
+                    hold = money(qty * limit_price + est_commission)
+                    c["cash_hold"] += hold
+                except (InvalidOperation, TypeError, ValueError):
+                    pass
 
         return {
             "trial_balance": {a: str(money(v)) for a, v in sorted(tb.items())},
