@@ -69,10 +69,12 @@ class Book:
         Posting twice is the single most expensive mistake available here.
         """
         eid = ev["event_id"]
-        self.events[eid] = ev
+
         if eid in self.seen:
             return []                      # already posted; nothing new happens
+
         self.seen.add(eid)
+        self.events[eid] = ev
 
         handler = getattr(self, "on_" + ev["type"], None)
         if handler is None:
@@ -165,9 +167,18 @@ class Book:
         ]
 
     def on_transfer_between_customers(self, p, ev):
-        raise NotImplementedError(
-            "Dr 2010 (from_customer_id) / Cr 2010 (to_customer_id). Both legs "
-            "land on 2010, so the ACCOUNT nets to zero")
+        try:
+            amount = money(D(str(p["amount"])))
+            from_customer = p["from_customer_id"]
+            to_customer = p["to_customer_id"]
+
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            raise Rejected("Invalid transfer_between_customers payload")
+
+        return [
+            leg("2010", from_customer, debit=amount),
+            leg("2010", to_customer, credit=amount)
+        ]
 
     def on_fx_deposit(self, p, ev):
         raise NotImplementedError(
