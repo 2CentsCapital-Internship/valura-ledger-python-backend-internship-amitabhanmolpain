@@ -26,8 +26,10 @@ D = Decimal
 ZERO = D("0.00")
 
 
-def money(x: Decimal) -> Decimal:
+def money(x: Decimal | int | float | str) -> Decimal:
     """2 decimal places, half away from zero. Not round(), which is half-even."""
+    if not isinstance(x, Decimal):
+        x = D(str(x))
     return x.quantize(D("0.01"), rounding=ROUND_HALF_UP)
 
 
@@ -59,6 +61,8 @@ class Book:
 
         # Store trades
         self.trades = {}
+
+        self.lots = defaultdict(lambda: defaultdict(list))
 
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
@@ -95,8 +99,8 @@ class Book:
         return legs
 
     def _post(self, legs: list[dict]) -> None:
-        dr = sum(D(l["debit"]) for l in legs)
-        cr = sum(D(l["credit"]) for l in legs)
+        dr = sum((D(l["debit"]) for l in legs), ZERO)
+        cr = sum((D(l["credit"]) for l in legs), ZERO)
         if money(dr) != money(cr):
             raise AssertionError(f"unbalanced: dr {dr} cr {cr}")
         for l in legs:
