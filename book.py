@@ -145,6 +145,10 @@ class Book:
 
         self.fees[ev["event_id"]] = amount
 
+        def undo_fee():
+            self.fees.pop(ev["event_id"], None)
+        self.undo_actions[ev["event_id"]].append(undo_fee)
+
         return [
             leg("2010", cid, debit=amount),
             leg("1100", cid, credit=amount)
@@ -232,6 +236,11 @@ class Book:
         self.withdrawals[wid] = req
         self.withdrawals[ev["event_id"]] = req
 
+        def undo_withdrawal():
+            self.withdrawals.pop(wid, None)
+            self.withdrawals.pop(ev["event_id"], None)
+        self.undo_actions[ev["event_id"]].append(undo_withdrawal)
+
         return [
             leg("2010", cid, debit=amount),
             leg("2300", cid, credit=amount)
@@ -284,6 +293,12 @@ class Book:
                 p["initial_quantity"] = qty
                 p["initial_hold"] = hold
             self.orders[p["order_id"]] = p
+
+            oid = p["order_id"]
+            def undo_order_placed():
+                self.orders.pop(oid, None)
+            self.undo_actions[ev["event_id"]].append(undo_order_placed)
+
         except (KeyError, InvalidOperation, TypeError, ValueError):
             raise Rejected("Invalid order")
 
