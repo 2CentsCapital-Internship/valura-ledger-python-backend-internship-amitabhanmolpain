@@ -20,6 +20,7 @@ Two things to get right before anything else:
 from __future__ import annotations
 
 from collections import defaultdict
+import copy
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 
 D = Decimal
@@ -73,6 +74,9 @@ class Book:
 
         # Reversed events set for double-reversal protection
         self.reversed_events = set()
+
+        # Reversal undo actions
+        self.undo_actions = defaultdict(list)
 
     # -----------------------------------------------------------------------
     def apply(self, ev: dict) -> list[dict]:
@@ -314,6 +318,13 @@ class Book:
             # Update customer position
             self.positions[cid][symbol] += quantity
 
+            def undo_buy():
+                self.trades.pop(trade_id, None)
+                if self.lots[cid][symbol]:
+                    self.lots[cid][symbol].pop()
+                self.positions[cid][symbol] -= quantity
+            self.undo_actions[ev["event_id"]].append(undo_buy)
+
             return [
                 leg("2010", cid, debit=principal + commission),
                 leg("1200", cid, debit=principal),
@@ -325,7 +336,7 @@ class Book:
 
         if side == "sell":
             # FIFO cost of shares sold
-            cost = self.consume_fifo(cid, symbol, quantity)
+            cost, undo_fifo = self.consume_fifo(cid, symbol, quantity)
 
             # Regulatory fee: principal x 0.0008, rounded to cent
             reg = money(principal * Decimal("0.0008"))
@@ -338,6 +349,12 @@ class Book:
                 "cost": cost,
                 "side": side
             }
+
+            def undo_sell():
+                self.trades.pop(trade_id, None)
+                self.positions[cid][symbol] += quantity
+                undo_fifo()
+            self.undo_actions[ev["event_id"]].append(undo_sell)
 
             # Update customer position
             self.positions[cid][symbol] -= quantity
@@ -407,13 +424,13 @@ class Book:
         if not acct:
             raise Rejected(f"Unknown broker: {broker}")
             
-        amount = self.balances[(cid, acct)]
-        if amount == ZERO:
+        owed = -self.balances.get((cid, acct), ZERO)
+        if owed <= ZERO:
             return []
             
         return [
-            leg(acct, cid, debit=amount),
-            leg("1100", cid, credit=amount)
+            leg(acct, cid, debit=owed),
+            leg("1100", cid, credit=owed)
         ]
 
     def on_custodian_fees_settled(self, p, ev):
@@ -422,13 +439,13 @@ class Book:
         except KeyError:
             raise Rejected("Invalid custodian_fees_settled payload")
             
-        amount = self.balances[(cid, "2420")]
-        if amount == ZERO:
+        owed = -self.balances.get((cid, "2420"), ZERO)
+        if owed <= ZERO:
             return []
             
         return [
-            leg("2420", cid, debit=amount),
-            leg("1100", cid, credit=amount)
+            leg("2420", cid, debit=owed),
+            leg("1100", cid, credit=owed)
         ]
 
     def on_partner_payout(self, p, ev):
@@ -437,13 +454,13 @@ class Book:
         except KeyError:
             raise Rejected("Invalid partner_payout payload")
             
-        amount = self.balances[(cid, "2430")]
-        if amount == ZERO:
+        owed = -self.balances.get((cid, "2430"), ZERO)
+        if owed <= ZERO:
             return []
             
         return [
-            leg("2430", cid, debit=amount),
-            leg("1100", cid, credit=amount)
+            leg("2430", cid, debit=owed),
+            leg("1100", cid, credit=owed)
         ]
 
     def on_reg_fees_remitted(self, p, ev):
@@ -452,13 +469,13 @@ class Book:
         except KeyError:
             raise Rejected("Invalid reg_fees_remitted payload")
             
-        amount = self.balances[(cid, "2400")]
-        if amount == ZERO:
+        owed = -self.balances.get((cid, "2400"), ZERO)
+        if owed <= ZERO:
             return []
             
         return [
-            leg("2400", cid, debit=amount),
-            leg("1100", cid, credit=amount)
+            leg("2400", cid, debit=owed),
+            leg("1100", cid, credit=owed)
         ]
 
     def on_dividend_cash(self, p, ev):
@@ -486,6 +503,12 @@ class Book:
         self.lots[cid][symbol].append({"quantity": qty, "cost": net})
         self.positions[cid][symbol] += qty
 
+        def undo_reinvest():
+            if self.lots[cid][symbol]:
+                self.lots[cid][symbol].pop()
+            self.positions[cid][symbol] -= qty
+        self.undo_actions[ev["event_id"]].append(undo_reinvest)
+
         return [
             leg("1200", cid, debit=net),
             leg("2100", cid, credit=net)
@@ -510,6 +533,14 @@ class Book:
         if symbol in self.positions[cid]:
             self.positions[cid][symbol] = (self.positions[cid][symbol] * ratio).normalize()
 
+        inverse_ratio = ratio_from / ratio_to
+        def undo_split():
+            for lot in self.lots[cid][symbol]:
+                lot["quantity"] = (lot["quantity"] * inverse_ratio).normalize()
+            if symbol in self.positions[cid]:
+                self.positions[cid][symbol] = (self.positions[cid][symbol] * inverse_ratio).normalize()
+        self.undo_actions[ev["event_id"]].append(undo_split)
+
         return []  # No legs
 
     def on_symbol_change(self, p, ev):
@@ -521,12 +552,23 @@ class Book:
             raise Rejected("Invalid symbol_change payload")
 
         # Re-key lots
+        moved_lots = False
         if old_sym in self.lots[cid]:
             self.lots[cid][new_sym] = self.lots[cid].pop(old_sym)
+            moved_lots = True
 
         # Re-key positions
+        moved_pos = False
         if old_sym in self.positions[cid]:
             self.positions[cid][new_sym] = self.positions[cid].pop(old_sym)
+            moved_pos = True
+
+        def undo_symbol_change():
+            if moved_lots and new_sym in self.lots[cid]:
+                self.lots[cid][old_sym] = self.lots[cid].pop(new_sym)
+            if moved_pos and new_sym in self.positions[cid]:
+                self.positions[cid][old_sym] = self.positions[cid].pop(new_sym)
+        self.undo_actions[ev["event_id"]].append(undo_symbol_change)
 
         return []  # No legs
 
@@ -541,6 +583,10 @@ class Book:
             raise Rejected("Already reversed")
 
         self.reversed_events.add(original_event)
+
+        if original_event in self.undo_actions:
+            for action in reversed(self.undo_actions[original_event]):
+                action()
 
         reversed_legs = []
 
@@ -557,12 +603,14 @@ class Book:
         return reversed_legs
 
     # -- helpers -------------------------------------------------------------
-    def consume_fifo(self, customer_id: str, symbol: str, quantity: Decimal) -> Decimal:
-        """Remove FIFO lots for a sell. Returns the total cost basis consumed."""
+    def consume_fifo(self, customer_id: str, symbol: str, quantity: Decimal) -> tuple[Decimal, callable]:
+        """Remove FIFO lots for a sell. Returns (total_cost_basis, undo_closure)."""
         lots = self.lots[customer_id][symbol]
 
         remaining = quantity
         total_cost = ZERO
+        
+        restored_lots = []
 
         while remaining > 0:
             if not lots:
@@ -573,19 +621,28 @@ class Book:
             if lot["quantity"] <= remaining:
                 total_cost += lot["cost"]
                 remaining -= lot["quantity"]
+                restored_lots.append((lot.copy(), True))
                 lots.pop(0)
             else:
                 ratio = remaining / lot["quantity"]
                 cost_used = money(lot["cost"] * ratio)
 
                 total_cost += cost_used
+                restored_lots.append((lot.copy(), False))
 
                 lot["cost"] -= cost_used
                 lot["quantity"] -= remaining
 
                 remaining = Decimal("0")
 
-        return money(total_cost)
+        def undo():
+            for original_lot, was_removed in reversed(restored_lots):
+                if was_removed:
+                    lots.insert(0, original_lot)
+                else:
+                    lots[0] = original_lot
+
+        return money(total_cost), undo
 
     # -- reporting ----------------------------------------------------------
     def snapshot(self) -> dict:
