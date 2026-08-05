@@ -184,7 +184,6 @@ class Book:
         ]
 
     def on_transfer_between_customers(self, p, ev):
-        print("transfer_between_customers called", p)
         try:
             amount = money(D(str(p["amount"])))
             from_customer = p["from_customer_id"]
@@ -283,6 +282,16 @@ class Book:
             commission = money(Decimal(str(p.get("commission", "0.00"))))
 
             trade_id = p["trade_id"]
+
+            if "order_id" in p:
+                if ev["type"] == "order_filled":
+                    self.orders.pop(p["order_id"], None)
+                elif ev["type"] == "order_partially_filled":
+                    oid = p["order_id"]
+                    if oid in self.orders:
+                        # Reduce the remaining quantity for the hold
+                        remaining = Decimal(str(self.orders[oid]["quantity"])) - quantity
+                        self.orders[oid]["quantity"] = str(remaining)
 
         except (KeyError, InvalidOperation, TypeError, ValueError):
             raise Rejected("Invalid order_filled payload")
@@ -387,20 +396,70 @@ class Book:
         return self.on_order_cancelled(p, ev)
 
     def on_broker_fees_settled(self, p, ev):
-        print("BROKER FEES SETTLED:", p)
-        raise NotImplementedError()
+        try:
+            cid = p["customer_id"]
+            broker = p["broker"]
+        except KeyError:
+            raise Rejected("Invalid broker_fees_settled payload")
+            
+        acct_map = {"BRK-A": "2411", "BRK-B": "2412", "BRK-C": "2413"}
+        acct = acct_map.get(broker)
+        if not acct:
+            raise Rejected(f"Unknown broker: {broker}")
+            
+        amount = self.balances[(cid, acct)]
+        if amount == ZERO:
+            return []
+            
+        return [
+            leg(acct, cid, debit=amount),
+            leg("1100", cid, credit=amount)
+        ]
 
     def on_custodian_fees_settled(self, p, ev):
-        print("CUSTODIAN FEES:", p)
-        raise NotImplementedError()
+        try:
+            cid = p["customer_id"]
+        except KeyError:
+            raise Rejected("Invalid custodian_fees_settled payload")
+            
+        amount = self.balances[(cid, "2420")]
+        if amount == ZERO:
+            return []
+            
+        return [
+            leg("2420", cid, debit=amount),
+            leg("1100", cid, credit=amount)
+        ]
 
     def on_partner_payout(self, p, ev):
-        print("PARTNER PAYOUT:", p)
-        raise NotImplementedError()
+        try:
+            cid = p["customer_id"]
+        except KeyError:
+            raise Rejected("Invalid partner_payout payload")
+            
+        amount = self.balances[(cid, "2430")]
+        if amount == ZERO:
+            return []
+            
+        return [
+            leg("2430", cid, debit=amount),
+            leg("1100", cid, credit=amount)
+        ]
 
     def on_reg_fees_remitted(self, p, ev):
-        print("REG FEES:", p)
-        raise NotImplementedError()
+        try:
+            cid = p["customer_id"]
+        except KeyError:
+            raise Rejected("Invalid reg_fees_remitted payload")
+            
+        amount = self.balances[(cid, "2400")]
+        if amount == ZERO:
+            return []
+            
+        return [
+            leg("2400", cid, debit=amount),
+            leg("1100", cid, credit=amount)
+        ]
 
     def on_dividend_cash(self, p, ev):
         try:
