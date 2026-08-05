@@ -208,6 +208,8 @@ class Book:
             cid = p["customer_id"]
 
             spread = money(market - customer)
+            if spread < ZERO:
+                raise Rejected("Negative FX spread")
 
         except (InvalidOperation, KeyError, TypeError, ValueError):
             raise Rejected("Invalid fx_deposit payload")
@@ -226,7 +228,7 @@ class Book:
         except (InvalidOperation, KeyError, TypeError, ValueError):
             raise Rejected("Invalid withdrawal_requested payload")
 
-        req = {"amount": amount, "customer_id": cid}
+        req = {"amount": amount, "customer_id": cid, "req_event_id": ev["event_id"]}
         self.withdrawals[wid] = req
         self.withdrawals[ev["event_id"]] = req
 
@@ -244,6 +246,10 @@ class Book:
         except (KeyError, InvalidOperation, TypeError, ValueError):
             raise Rejected("Invalid withdrawal_settled payload or request not found")
 
+        self.withdrawals.pop(wid, None)
+        if "req_event_id" in req:
+            self.withdrawals.pop(req["req_event_id"], None)
+
         return [
             leg("2300", cid, debit=amount),
             leg("1100", cid, credit=amount)
@@ -258,6 +264,10 @@ class Book:
         except (KeyError, InvalidOperation, TypeError, ValueError):
             raise Rejected("Invalid withdrawal_rejected payload or request not found")
 
+        self.withdrawals.pop(wid, None)
+        if "req_event_id" in req:
+            self.withdrawals.pop(req["req_event_id"], None)
+
         return [
             leg("2300", cid, debit=amount),
             leg("2010", cid, credit=amount)
@@ -265,8 +275,16 @@ class Book:
 
     def on_order_placed(self, p, ev):
         try:
+            if p.get("side") == "buy":
+                qty = Decimal(str(p["quantity"]))
+                limit = Decimal(str(p["limit_price"]))
+                comm = Decimal(str(p.get("est_commission", "0")))
+                hold = money(qty * limit + comm)
+                p["hold"] = hold
+                p["initial_quantity"] = qty
+                p["initial_hold"] = hold
             self.orders[p["order_id"]] = p
-        except KeyError:
+        except (KeyError, InvalidOperation, TypeError, ValueError):
             raise Rejected("Invalid order")
 
         return []
@@ -292,10 +310,13 @@ class Book:
                     self.orders.pop(p["order_id"], None)
                 elif ev["type"] == "order_partially_filled":
                     oid = p["order_id"]
-                    if oid in self.orders:
-                        # Reduce the remaining quantity for the hold
-                        remaining = Decimal(str(self.orders[oid]["quantity"])) - quantity
-                        self.orders[oid]["quantity"] = str(remaining)
+                    if oid in self.orders and self.orders[oid].get("side") == "buy":
+                        # A fill releases a proportional share of the hold that order placed
+                        order = self.orders[oid]
+                        if "initial_quantity" in order and "initial_hold" in order:
+                            ratio = quantity / order["initial_quantity"]
+                            released = money(order["initial_hold"] * ratio)
+                            order["hold"] -= released
 
         except (KeyError, InvalidOperation, TypeError, ValueError):
             raise Rejected("Invalid order_filled payload")
@@ -362,6 +383,8 @@ class Book:
             # Remove position if fully sold out
             if self.positions[cid][symbol] <= 0:
                 del self.positions[cid][symbol]
+                if not self.positions[cid]:
+                    del self.positions[cid]
 
             return [
                 leg("1150", cid, debit=principal),
@@ -378,7 +401,7 @@ class Book:
     def on_trade_settled(self, p, ev):
         try:
             trade_id = p["trade_id"]
-            trade = self.trades[trade_id]
+            trade = self.trades.pop(trade_id)
 
             amount = trade["principal"]
             cid = trade["customer_id"]
@@ -607,15 +630,15 @@ class Book:
         """Remove FIFO lots for a sell. Returns (total_cost_basis, undo_closure)."""
         lots = self.lots[customer_id][symbol]
 
+        if sum(lot["quantity"] for lot in lots) < quantity:
+            raise Rejected("Oversell")
+
         remaining = quantity
         total_cost = ZERO
         
         restored_lots = []
 
         while remaining > 0:
-            if not lots:
-                raise Rejected("Oversell")
-
             lot = lots[0]
 
             if lot["quantity"] <= remaining:
@@ -635,12 +658,18 @@ class Book:
 
                 remaining = Decimal("0")
 
+        if not lots:
+            del self.lots[customer_id][symbol]
+            if not self.lots[customer_id]:
+                del self.lots[customer_id]
+
         def undo():
+            target_lots = self.lots[customer_id][symbol]
             for original_lot, was_removed in reversed(restored_lots):
                 if was_removed:
-                    lots.insert(0, original_lot)
+                    target_lots.insert(0, original_lot)
                 else:
-                    lots[0] = original_lot
+                    target_lots[0] = original_lot
 
         return money(total_cost), undo
 
@@ -663,14 +692,14 @@ class Book:
             if acct == "2010":
                 c["wallet_cash"] += -bal          # a liability, so credit-positive
 
-        # Build positions from FIFO lots
-        for cid, symbols in self.lots.items():
+        # Build positions from self.positions
+        for cid, symbols in self.positions.items():
             c = customers.setdefault(cid, {"wallet_cash": ZERO,
                                            "cash_hold": ZERO, "positions": {}})
-            for symbol, lots in symbols.items():
-                total_qty = sum(lot["quantity"] for lot in lots)
-                total_cost = sum(lot["cost"] for lot in lots)
+            for symbol, total_qty in symbols.items():
                 if total_qty > ZERO:
+                    lots = self.lots[cid][symbol]
+                    total_cost = sum(lot["cost"] for lot in lots)
                     c["positions"][symbol] = {
                         "quantity": f"{total_qty:f}",
                         "cost_basis": str(money(total_cost))
@@ -686,11 +715,7 @@ class Book:
             side = order.get("side")
             if side == "buy":
                 try:
-                    qty = Decimal(str(order.get("quantity", "0")))
-                    limit_price = Decimal(str(order.get("limit_price", "0")))
-                    est_commission = Decimal(str(order.get("est_commission", "0")))
-                    hold = money(qty * limit_price + est_commission)
-                    c["cash_hold"] += hold
+                    c["cash_hold"] += order.get("hold", ZERO)
                 except (InvalidOperation, TypeError, ValueError):
                     pass
 
