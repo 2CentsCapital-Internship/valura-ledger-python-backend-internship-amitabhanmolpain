@@ -44,12 +44,10 @@ class Book:
         # balances[(customer_id, account)] = debit-positive balance
         self.balances: dict[tuple[str, str], Decimal] = defaultdict(lambda: ZERO)
         self.seen: set[str] = set()
+        self.accounts_seen: set[str] = set()
         # What you have not written yet. An unimplemented handler must not stop
         # the run: the client keeps consuming and tells you the list at the end.
         self.todo: dict[str, int] = defaultdict(int)
-
-        # Store previous events
-        self.events = {}
 
         # Store withdrawal requests
         self.withdrawals = {}
@@ -92,7 +90,6 @@ class Book:
             return []                      # already posted; nothing new happens
 
         self.seen.add(eid)
-        self.events[eid] = ev
 
         handler = getattr(self, "on_" + ev["type"], None)
         if handler is None:
@@ -112,7 +109,6 @@ class Book:
         self._post(legs)
         # Store the posted legs so reversals can invert them later
         self.posted_legs[eid] = legs
-        self.events[eid]["_posted_legs"] = legs
         return legs
 
     def _post(self, legs: list[dict]) -> None:
@@ -121,6 +117,7 @@ class Book:
         if money(dr) != money(cr):
             raise AssertionError(f"unbalanced: dr {dr} cr {cr}")
         for l in legs:
+            self.accounts_seen.add(l["account"])
             self.balances[(l["customer_id"], l["account"])] += (
                 D(l["debit"]) - D(l["credit"]))
 
@@ -143,7 +140,7 @@ class Book:
         except (InvalidOperation, TypeError, ValueError, KeyError) as e:
             raise Rejected(f"Invalid fee_charged payload: {p}") from e
 
-        self.fees[ev["event_id"]] = amount
+        self.fees[ev["event_id"]] = {"amount": amount, "customer_id": cid}
 
         def undo_fee():
             self.fees.pop(ev["event_id"], None)
@@ -159,12 +156,13 @@ class Book:
             refund_id = p["refunds_source_id"]
 
             if refund_id not in self.fees:
-                raise Rejected("Original fee not found")
+                raise Rejected("Original fee not found or already refunded")
 
-            amount = self.fees[refund_id]
+            fee = self.fees.pop(refund_id)  # consume: a fee can only be refunded once
+            amount = fee["amount"]
 
-            original = self.events[refund_id]
-            cid = original["payload"]["customer_id"]
+            # Protocol: customer_id is in the fee_refund payload itself
+            cid = p.get("customer_id") or fee["customer_id"]
 
         except (KeyError, InvalidOperation, TypeError, ValueError):
             raise Rejected("Invalid fee_refund payload")
@@ -284,15 +282,16 @@ class Book:
 
     def on_order_placed(self, p, ev):
         try:
-            if p.get("side") == "buy":
-                qty = Decimal(str(p["quantity"]))
-                limit = Decimal(str(p["limit_price"]))
-                comm = Decimal(str(p.get("est_commission", "0")))
+            order = dict(p)
+            if order.get("side") == "buy":
+                qty = Decimal(str(order["quantity"]))
+                limit = Decimal(str(order["limit_price"]))
+                comm = Decimal(str(order.get("est_commission", "0")))
                 hold = money(qty * limit + comm)
-                p["hold"] = hold
-                p["initial_quantity"] = qty
-                p["initial_hold"] = hold
-            self.orders[p["order_id"]] = p
+                order["hold"] = hold
+                order["initial_quantity"] = qty
+                order["initial_hold"] = hold
+            self.orders[order["order_id"]] = order
 
             oid = p["order_id"]
             def undo_order_placed():
@@ -322,16 +321,22 @@ class Book:
 
             if "order_id" in p:
                 if ev["type"] == "order_filled":
+                    # Final fill closes the order. Protocol: released hold stays released.
                     self.orders.pop(p["order_id"], None)
                 elif ev["type"] == "order_partially_filled":
                     oid = p["order_id"]
                     if oid in self.orders and self.orders[oid].get("side") == "buy":
-                        # A fill releases a proportional share of the hold that order placed
                         order = self.orders[oid]
                         if "initial_quantity" in order and "initial_hold" in order:
-                            ratio = quantity / order["initial_quantity"]
-                            released = money(order["initial_hold"] * ratio)
-                            order["hold"] -= released
+                            # Track cumulative filled quantity to avoid rounding drift.
+                            # Remaining hold = initial_hold * (remaining_qty / initial_qty)
+                            # This resets precision on every fill instead of accumulating
+                            # independently-rounded subtractions.
+                            filled_so_far = order.get("filled_quantity", ZERO) + quantity
+                            order["filled_quantity"] = filled_so_far
+                            remaining_qty = max(ZERO, order["initial_quantity"] - filled_so_far)
+                            # Protocol: released hold stays released — no undo registered
+                            order["hold"] = money(order["initial_hold"] * remaining_qty / order["initial_quantity"])
 
         except (KeyError, InvalidOperation, TypeError, ValueError):
             raise Rejected("Invalid order_filled payload")
@@ -345,20 +350,29 @@ class Book:
                 "side": side
             }
 
-            # Add FIFO lot
-            self.lots[cid][symbol].append({
-                "quantity": quantity,
-                "cost": principal
-            })
+            # Add FIFO lot — capture the exact object for reversal
+            new_lot = {
+                "quantity": quantity, 
+                "cost": principal,
+                "initial_quantity": quantity,
+                "initial_cost": principal
+            }
+            self.lots[cid][symbol].append(new_lot)
 
             # Update customer position
             self.positions[cid][symbol] += quantity
 
             def undo_buy():
                 self.trades.pop(trade_id, None)
-                if self.lots[cid][symbol]:
-                    self.lots[cid][symbol].pop()
+                try:
+                    self.lots[cid][symbol].remove(new_lot)  # exact object, not last
+                except ValueError:
+                    pass
                 self.positions[cid][symbol] -= quantity
+                if self.positions[cid][symbol] <= 0:
+                    del self.positions[cid][symbol]
+                    if not self.positions[cid]:
+                        del self.positions[cid]
             self.undo_actions[ev["event_id"]].append(undo_buy)
 
             return [
@@ -500,7 +514,6 @@ class Book:
             leg("2430", cid, debit=owed),
             leg("1100", cid, credit=owed)
         ]
-
     def on_reg_fees_remitted(self, p, ev):
         try:
             cid = p["customer_id"]
@@ -538,13 +551,25 @@ class Book:
             raise Rejected("Invalid dividend_reinvested payload")
 
         # Add a FIFO lot at cost = net
-        self.lots[cid][symbol].append({"quantity": qty, "cost": net})
+        new_lot = {
+            "quantity": qty, 
+            "cost": net,
+            "initial_quantity": qty,
+            "initial_cost": net
+        }
+        self.lots[cid][symbol].append(new_lot)
         self.positions[cid][symbol] += qty
 
         def undo_reinvest():
-            if self.lots[cid][symbol]:
-                self.lots[cid][symbol].pop()
+            try:
+                self.lots[cid][symbol].remove(new_lot)
+            except ValueError:
+                pass
             self.positions[cid][symbol] -= qty
+            if self.positions[cid][symbol] <= 0:
+                del self.positions[cid][symbol]
+                if not self.positions[cid]:
+                    del self.positions[cid]
         self.undo_actions[ev["event_id"]].append(undo_reinvest)
 
         return [
@@ -565,18 +590,20 @@ class Book:
 
         # Scale quantity of each lot; total cost stays the same
         for lot in self.lots[cid][symbol]:
-            lot["quantity"] = (lot["quantity"] * ratio).normalize()
+            lot["quantity"] = lot["quantity"] * ratio
+            lot["initial_quantity"] = lot["initial_quantity"] * ratio
 
         # Update tracked position
         if symbol in self.positions[cid]:
-            self.positions[cid][symbol] = (self.positions[cid][symbol] * ratio).normalize()
+            self.positions[cid][symbol] = self.positions[cid][symbol] * ratio
 
         inverse_ratio = ratio_from / ratio_to
         def undo_split():
             for lot in self.lots[cid][symbol]:
-                lot["quantity"] = (lot["quantity"] * inverse_ratio).normalize()
+                lot["quantity"] = lot["quantity"] * inverse_ratio
+                lot["initial_quantity"] = lot["initial_quantity"] * inverse_ratio
             if symbol in self.positions[cid]:
-                self.positions[cid][symbol] = (self.positions[cid][symbol] * inverse_ratio).normalize()
+                self.positions[cid][symbol] = self.positions[cid][symbol] * inverse_ratio
         self.undo_actions[ev["event_id"]].append(undo_split)
 
         return []  # No legs
@@ -613,7 +640,7 @@ class Book:
     def on_reversal(self, p, ev):
         try:
             original_event = p["reverses_event_id"]
-            original_legs = self.posted_legs[original_event]
+            original_legs = self.posted_legs.pop(original_event)
         except KeyError:
             raise Rejected("Original event not found")
 
@@ -623,7 +650,7 @@ class Book:
         self.reversed_events.add(original_event)
 
         if original_event in self.undo_actions:
-            for action in reversed(self.undo_actions[original_event]):
+            for action in reversed(self.undo_actions.pop(original_event)):
                 action()
 
         reversed_legs = []
@@ -662,14 +689,20 @@ class Book:
                 restored_lots.append((lot.copy(), True))
                 lots.pop(0)
             else:
-                ratio = remaining / lot["quantity"]
-                cost_used = money(lot["cost"] * ratio)
+                new_qty = lot["quantity"] - remaining
+                # To prevent drift, we compute exactly what the residual fractional cost
+                # basis SHOULD be based on the initial lot parameters.
+                new_cost = money(lot["initial_cost"] * new_qty / lot["initial_quantity"])
+                
+                # The cost posted to the journal is the exact difference, forcing the 
+                # ledger to balance without accumulating recursive rounding drift.
+                cost_used = lot["cost"] - new_cost
 
                 total_cost += cost_used
                 restored_lots.append((lot.copy(), False))
 
-                lot["cost"] -= cost_used
-                lot["quantity"] -= remaining
+                lot["cost"] = new_cost
+                lot["quantity"] = new_qty
 
                 remaining = Decimal("0")
 
@@ -697,6 +730,11 @@ class Book:
         liabilities carry a negative sign.
         """
         tb: dict[str, Decimal] = defaultdict(lambda: ZERO)
+        
+        # Explicitly seed all seen accounts so none are omitted if zero
+        for acct in self.accounts_seen:
+            tb[acct] = ZERO
+            
         for (_cid, acct), bal in self.balances.items():
             tb[acct] += bal
 
